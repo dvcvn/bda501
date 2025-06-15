@@ -1,6 +1,7 @@
 import json
 import logging
 import findspark
+import os
 findspark.init()
 
 from pyspark.sql import SparkSession
@@ -14,16 +15,18 @@ logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
 # Load Kafka configuration
-with open('config/kafka_config.json', 'r') as f:
+config_path = os.path.join(os.path.dirname(__file__), 'config/kafka_config.json')
+with open(config_path, 'r') as f:
     kafka_config = json.load(f)
 
 # Initialize Spark session with Kafka support
 spark = SparkSession.builder \
     .appName("MovieRecommenderConsumer") \
-    .config("spark.driver.memory", "4g") \
-    .config("spark.executor.memory", "4g") \
+    .config("spark.driver.host", "localhost") \
     .config("spark.jars.packages", "org.apache.spark:spark-sql-kafka-0-10_2.12:3.5.0") \
     .getOrCreate()
+
+model = ALSModel.load("/models/als_model")
 
 # Define schemas
 user_schema = StructType([
@@ -51,6 +54,8 @@ def load_model(model_path):
 def process_user_recommendations(model, user_id):
     """Generate recommendations for a user using the trained model."""
     try:
+        if model is None:
+            model = load_model("/models/als_model")
         # Create a DataFrame with the user ID
         user_df = spark.createDataFrame([(user_id,)], ["userId"])
         
@@ -92,55 +97,61 @@ def process_kafka_messages(model):
     while True:
         try:
             # Read from Kafka
-            df = spark.read \
+            df = spark.readStream \
                 .format("kafka") \
                 .option("kafka.bootstrap.servers", kafka_config['bootstrap_servers']) \
                 .option("subscribe", kafka_config['input_topic']) \
                 .option("startingOffsets", "latest") \
-                .option("failOnDataLoss", "false") \
                 .load()
-            
-            # Parse JSON and extract user IDs
+
             parsed_df = df.select(
                 from_json(col("value").cast("string"), user_schema).alias("data")
             ).select("data.*")
             
-            # Process each user ID
-            user_ids = parsed_df.collect()
-            
-            if user_ids:
-                logger.info(f"Processing {len(user_ids)} user IDs...")
-                
-                # Generate recommendations for all users
-                recommendations_list = []
-                for row in user_ids:
-                    user_id = row.userId
-                    recommendations = process_user_recommendations(model, user_id)
-                    if recommendations:
-                        recommendations_list.append((user_id, recommendations))
-                
-                if recommendations_list:
-                    # Create DataFrame with recommendations
-                    recommendations_df = spark.createDataFrame(
-                        recommendations_list,
-                        ["userId", "recommendations"]
-                    )
-                    
-                    # Send to Kafka
-                    send_recommendations_to_kafka(recommendations_df)
-            
-            logger.info("Waiting for new messages...")
-            time.sleep(5)  # Wait before checking for new messages
-            
+            parsed_df.writeStream \
+                .foreachBatch(lambda batch_df, batch_id: process_batch(batch_df, batch_id, model)) \
+                .start() \
+                .awaitTermination()
+                        
         except Exception as e:
             logger.error(f"Error processing Kafka messages: {str(e)}")
             time.sleep(5)  # Wait before retrying
             continue
 
+def process_batch(batch_df, batch_id, model):
+    logger.info("Process a batch of user IDs and generate recommendations.")
+    try:
+        batch_df.show()
+        # Process each user ID
+        user_ids = batch_df.collect()
+        
+        if user_ids:
+            logger.info(f"Processing {len(user_ids)} user IDs...")
+            
+            # Generate recommendations for all users
+            recommendations_list = []
+            for row in user_ids:
+                user_id = row.userId
+                recommendations = process_user_recommendations(model, user_id)
+                if recommendations:
+                    recommendations_list.append((user_id, recommendations))
+            
+            if recommendations_list:
+                # Create DataFrame with recommendations
+                recommendations_df = spark.createDataFrame(
+                    recommendations_list,
+                    ["userId", "recommendations"]
+                )
+                
+                # Send to Kafka
+                send_recommendations_to_kafka(recommendations_df)
+    except Exception as e:
+        logger.error(f"Error processing batch: {str(e)}")
+
 def main():
     try:
         # Load the trained model
-        model = load_model("models/als_model")
+        model = load_model("/models/als_model")
         logger.info("Model loaded successfully")
         
         # Start processing Kafka messages
@@ -155,3 +166,4 @@ def main():
 
 if __name__ == "__main__":
     main() 
+

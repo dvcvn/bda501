@@ -1,5 +1,6 @@
 import json
 import os
+import shutil
 
 from pyspark.sql import SparkSession
 from pyspark.ml.recommendation import ALS
@@ -11,16 +12,14 @@ logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
 # Load Kafka configuration
-with open('config/kafka_config.json', 'r') as f:
+config_path = os.path.join(os.path.dirname(__file__), 'config/kafka_config.json')
+with open(config_path, 'r') as f:
     kafka_config = json.load(f)
 
 # Initialize Spark session with Kafka support
 spark = SparkSession.builder \
     .appName("MovieRecommender") \
-    .config("spark.driver.memory", "4g") \
-    .config("spark.executor.memory", "4g") \
-    .config("spark.sql.shuffle.partitions", "200") \
-    .config("spark.default.parallelism", "200") \
+    .config("spark.driver.host", "localhost") \
     .config("spark.jars.packages", "org.apache.spark:spark-sql-kafka-0-10_2.12:3.5.0") \
     .getOrCreate()
 
@@ -62,43 +61,55 @@ def train_model(ratings_df):
     
     # Evaluate model
     predictions = model.transform(test)
+    
     return model, predictions
 
 def send_to_kafka(recommendations_df):
     """Send recommendations to Kafka topic using Spark's Kafka integration."""
     logger.info("Sending recommendations to Kafka...")
     
-    # Convert recommendations to JSON format
-    recommendations_json = recommendations_df.selectExpr(
-        "CAST(userId AS STRING) as key",
-        "to_json(struct(userId, recommendations)) as value"
-    )
-    
-    # Write to Kafka
-    recommendations_json.write \
-        .format("kafka") \
-        .option("kafka.bootstrap.servers", kafka_config['bootstrap_servers']) \
-        .option("topic", kafka_config['output_topic']) \
-        .save()
-    
-    logger.info("Finished sending recommendations to Kafka")
+    try:
+        # Convert recommendations to JSON format
+        recommendations_json = recommendations_df.selectExpr(
+            "CAST(userId AS STRING) as key",
+            "to_json(struct(userId, recommendations)) as value"
+        )
+        recommendations_json.show(truncate=False)
+        logger.info(f"Recommendations JSON: {recommendations_json.show()}")
+        
+        # Write to Kafka
+        recommendations_json.write \
+            .format("kafka") \
+            .option("kafka.bootstrap.servers", kafka_config['bootstrap_servers']) \
+            .option("topic", kafka_config['output_topic']) \
+            .save()
+        
+        logger.info("Finished sending recommendations to Kafka")
+    except Exception as e:
+        logger.error(f"Failed to send to Kafka: {e}", exc_info=True)
 
 def main():
     # Load data
-    ratings_df = load_data('data/ratings.csv')
+    ratings_df = load_data('/data/ratings.csv')
     
     # Train model
     model, predictions = train_model(ratings_df)
     
     # Generate recommendations
     recommendations_df = model.recommendForAllUsers(10)
+
+    logger.info(f"Recommendations: {recommendations_df.show()}")
+
+    recommendations_df.printSchema()
+    recommendations_df.show(truncate=False)
+    recommendations_df.count()
     
     # Send to Kafka
     send_to_kafka(recommendations_df)
     
     # Save model (optional)
-    model.save("models/als_model")
-    
+    model.save("/models/als_model")
+
     spark.stop()
 
 if __name__ == "__main__":
