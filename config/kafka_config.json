@@ -1,0 +1,7 @@
+{
+    "bootstrap_servers": "localhost:9092",
+    "input_topic": "user-requests",
+    "output_topic": "movie-recommendations",
+    "group_id": "movie-recommender-group",
+    "auto_offset_reset": "earliest"
+} 
