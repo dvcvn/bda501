@@ -1,11 +1,13 @@
 import json
 import os
 import shutil
-
 from pyspark.sql import SparkSession
 from pyspark.ml.recommendation import ALS
 from pyspark.sql.types import StructType, StructField, IntegerType, FloatType, LongType
+from pyspark.sql.functions import col, expr, collect_list, struct, explode
 import logging
+from pyspark.ml.evaluation import RegressionEvaluator
+from pyspark.sql import functions as F
 
 # Configure logging
 logging.basicConfig(level=logging.INFO)
@@ -51,7 +53,7 @@ def train_model(ratings_df):
         ratingCol='rating',
         coldStartStrategy='drop',
         nonnegative=True,
-        rank=10,
+        rank=16,
         maxIter=10,
         regParam=0.1
     )
@@ -94,23 +96,64 @@ def main():
     
     # Train model
     model, predictions = train_model(ratings_df)
-    
+    evaluate_model(model, predictions, ratings_df)
+
     # Generate recommendations
-    recommendations_df = model.recommendForAllUsers(10)
+#     recommendations_df = model.recommendForAllUsers(10)
 
-    logger.info(f"Recommendations: {recommendations_df.show()}")
-
-    recommendations_df.printSchema()
-    recommendations_df.show(truncate=False)
-    recommendations_df.count()
+#     logger.info(f"Recommendations: {recommendations_df.show()}")
+#
+#     recommendations_df.printSchema()
+#     recommendations_df.show(truncate=False)
+#     recommendations_df.count()
     
     # Send to Kafka
-    send_to_kafka(recommendations_df)
+#     send_to_kafka(recommendations_df)
     
     # Save model (optional)
-    model.save("/models/als_model")
+    model.write().overwrite().save("/models/als_model")
 
     spark.stop()
+
+
+def evaluate_model(model, predictions, ratings_df, top_k=10):
+    evaluator = RegressionEvaluator(metricName="rmse", labelCol="rating", predictionCol="prediction")
+    rmse = evaluator.evaluate(predictions)
+
+    logger.info(f"✅ RMSE = {rmse:.4f}")
+
+    # Precision@K, NDCG@K
+    userRecs = model.recommendForAllUsers(top_k)
+    relevant = ratings_df.filter("rating >= 4.0").groupBy("userId").agg(collect_list("movieId").alias("true_items"))
+    predicted = userRecs.select("userId", explode("recommendations").alias("rec")) \
+        .select("userId", col("rec.movieId").alias("movieId"))
+    predicted_grouped = predicted.groupBy("userId").agg(collect_list("movieId").alias("predicted_items"))
+    joined = predicted_grouped.join(relevant, on="userId")
+
+    import math
+    def precision_at_k(pred, actual, k=10):
+        pred_k = pred[:k]
+        return len(set(pred_k) & set(actual)) / float(k)
+
+    def ndcg_at_k(pred, actual, k=10):
+        pred_k = pred[:k]
+        dcg = sum(1.0 / math.log2(i + 2) for i, p in enumerate(pred_k) if p in actual)
+        idcg = sum(1.0 / math.log2(i + 2) for i in range(min(len(actual), k)))
+        return dcg / idcg if idcg > 0 else 0.0
+
+    precision_list = []
+    ndcg_list = []
+
+    for row in joined.collect():
+        precision_list.append(precision_at_k(row['predicted_items'], row['true_items'], k=top_k))
+        ndcg_list.append(ndcg_at_k(row['predicted_items'], row['true_items'], k=top_k))
+
+    avg_precision = sum(precision_list) / len(precision_list)
+    avg_ndcg = sum(ndcg_list) / len(ndcg_list)
+
+    logger.info(f"🎯 Precision@{top_k} = {avg_precision:.4f}")
+    logger.info(f"📈 NDCG@{top_k} = {avg_ndcg:.4f}")
+
 
 if __name__ == "__main__":
     main() 
